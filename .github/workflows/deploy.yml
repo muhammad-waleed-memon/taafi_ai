@@ -1,0 +1,111 @@
+# Copyright 2026 Muhammad Waleed & Areeba
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Taafi.ai CI/CD Autopilot Delivery
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  ALIBABA_CLOUD_REGION: cn-hangzhou
+  ACR_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ACR_NAMESPACE: taafi-autopilot
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build & Push microservices to Alibaba ACR
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Alibaba Cloud ACR
+      uses: aliyun/acr-login@v1
+      with:
+        login-url: https://${{ env.ACR_REGISTRY }}
+        username: ${{ secrets.ALIBABA_ACR_USERNAME }}
+        password: ${{ secrets.ALIBABA_ACR_PASSWORD }}
+
+    - name: Build and Push Core Engine Image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./services/core-engine
+        push: true
+        tags: |
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/core-engine:latest
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/core-engine:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and Push Neural Orchestrator Image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./services/neural-orchestrator
+        push: true
+        tags: |
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/neural-orchestrator:latest
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/neural-orchestrator:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and Push React Web Dashboard Image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./web
+        push: true
+        tags: |
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/web-dashboard:latest
+          ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/web-dashboard:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-to-alibaba:
+    name: Hot-promote Zero-Downtime Rollout to Alibaba ACK
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Setup Alibaba Cloud CLI Credentials
+      uses: aliyun/setup-cli-action@v1
+      with:
+        access-key-id: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+        access-key-secret: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+        region-id: ${{ env.ALIBABA_CLOUD_REGION }}
+
+    - name: Get ACK Kubernetes Kubeconfig Credentials
+      run: |
+        aliyun cs GET /k8s/${{ secrets.ALIBABA_ACK_CLUSTER_ID }}/user_config --RegionId ${{ env.ALIBABA_CLOUD_REGION }} | jq -r '.config' > kubeconfig
+        mkdir -p ~/.kube
+        mv kubeconfig ~/.kube/config
+        chmod 600 ~/.kube/config
+
+    - name: Rolling Zero-Downtime Update to Kubernetes Pods
+      run: |
+        kubectl set image deployment/core-engine-deploy core-engine=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/core-engine:${{ env.IMAGE_TAG }} --record
+        kubectl set image deployment/neural-orchestrator-deploy neural-orchestrator=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/neural-orchestrator:${{ env.IMAGE_TAG }} --record
+        kubectl set image deployment/web-dashboard-deploy web-dashboard=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/web-dashboard:${{ env.IMAGE_TAG }} --record
+        
+        # Verify rollout status to guarantee zero degradation
+        kubectl rollout status deployment/core-engine-deploy --timeout=120s
+        kubectl rollout status deployment/neural-orchestrator-deploy --timeout=120s
+        kubectl rollout status deployment/web-dashboard-deploy --timeout=120s
