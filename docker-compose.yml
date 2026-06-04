@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: taafi-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: taafi
+      POSTGRES_PASSWORD: taafi_pass
+      POSTGRES_DB: taafi
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:7.2-alpine
+    container_name: taafi-valkey
+    ports:
+      - "6379:6379"
+
+  core-engine:
+    build:
+      context: ./services/core-engine
+    container_name: taafi-core-engine
+    ports:
+      - "8000:8000"
+    environment:
+      TAAFI_DB_URL: postgresql://taafi:taafi_pass@postgres:5432/taafi
+      VALKEY_URL: redis://valkey:6379
+      TAAFI_LOG_DIR: /app/logs
+      ALLOWED_ORIGINS: "*"
+    depends_on:
+      - postgres
+      - valkey
+    volumes:
+      - core_logs:/app/logs
+
+  neural-orchestrator:
+    build:
+      context: ./services/neural-orchestrator
+    container_name: taafi-neural-orchestrator
+    environment:
+      VALKEY_URL: redis://valkey:6379
+      CORE_ENGINE_URL: http://core-engine:8000
+      DASHSCOPE_API_KEY: "" # user can supply this locally to enable real Qwen calling
+    depends_on:
+      - core-engine
+      - valkey
+
+  web-dashboard:
+    build:
+      context: ./web
+    container_name: taafi-web-dashboard
+    ports:
+      - "80:80"
+    depends_on:
+      - core-engine
+
+volumes:
+  postgres_data:
+  core_logs:

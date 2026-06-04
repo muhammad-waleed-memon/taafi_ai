@@ -28,7 +28,7 @@ export default function ConsoleTerminal() {
     ]);
 
     // Connect to Core Engine Server-Sent Events (SSE) streaming API
-    const eventSource = new EventSource('http://localhost:8000/api/stream');
+    const eventSource = new EventSource('/api/stream');
 
     eventSource.onmessage = (event) => {
       try {

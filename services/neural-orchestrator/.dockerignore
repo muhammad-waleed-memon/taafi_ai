@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+Dockerfile
+docker-compose.yml
+kubernetes/
+k8s/
+tests/

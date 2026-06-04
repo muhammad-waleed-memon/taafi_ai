@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: taafi-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # Alibaba Cloud ACK SSD storage class. Can fall back to standard in generic environments.
+  storageClassName: alicloud-disk-ssd
+  resources:
+    requests:
+      storage: 10Gi

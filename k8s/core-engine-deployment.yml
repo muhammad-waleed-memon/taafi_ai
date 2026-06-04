@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-engine-deploy
+  namespace: taafi-system
+  labels:
+    app: core-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: core-engine
+  template:
+    metadata:
+      labels:
+        app: core-engine
+    spec:
+      containers:
+        - name: core-engine
+          # Build target image path, matching the ACR setup in CI/CD pipeline
+          image: registry.cn-hangzhou.aliyuncs.com/taafi-autopilot/core-engine:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: TAAFI_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: taafi-secret
+                  key: TAAFI_DB_URL
+            - name: VALKEY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: taafi-config
+                  key: VALKEY_URL
+            - name: TAAFI_LOG_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: taafi-config
+                  key: TAAFI_LOG_DIR
+            - name: ALLOWED_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: taafi-config
+                  key: ALLOWED_ORIGINS
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: log-storage
+              mountPath: /app/logs
+      volumes:
+        - name: log-storage
+          emptyDir: {}

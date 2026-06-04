@@ -1,0 +1,42 @@
+graph TD
+    subgraph "Alibaba Cloud ACK Cluster"
+        Dashboard["React Dashboard (Web Dashboard)"]
+        Core["Core Engine (FastAPI Backend)"]
+        Orch["Neural Orchestrator (Autopilot worker)"]
+        Valkey["Valkey (Pub/Sub Channel Bus)"]
+        DB[(PostgreSQL Production Instance)]
+    end
+
+    subgraph "External AI Platform"
+        Qwen["Alibaba DashScope (Qwen-Max API)"]
+    end
+
+    %% Flow of Incident trapping
+    DB -- "Deadlock Detected" --> Core
+    Core -- "Publish Trapped Incident" --> Valkey
+    Valkey -- "Subscribes to taafi:incidents" --> Orch
+
+    %% Flow of Remediation Generation
+    Orch -- "1. Minifies & Compresses DDL Context" --> Orch
+    Orch -- "2. RAG Memory retrieval query" --> Core
+    Core -- "Query similar past history" --> DB
+    Orch -- "3. Prompt Injection (Few-Shot) -> Invoke LLM" --> Qwen
+    Qwen -- "Returns SQL patch (Structured Tool call)" --> Orch
+    Orch -- "4. isolated dry-run Sandbox run" --> Orch
+
+    %% Human in the loop gate
+    Orch -- "5. Risk Evaluation" --> Gate{Is Tool 'create_index'?}
+    Gate -- "Yes (Safe: Low-Risk)" --> Core
+    Gate -- "No (Destructive: High-Risk)" --> Approvals["Create Pending Approval (POST /api/approvals)"]
+    Approvals -- "Saves to approvals database" --> DB
+    Dashboard -- "Renders Pending Approvals" --> Dashboard
+    Dashboard -- "POST Approve / Reject with operator comments" --> Core
+    Core -- "Publish APPROVAL_GRANTED" --> Valkey
+    Valkey -- "Subscribes to APPROVAL_GRANTED" --> Orch
+    Orch -- "Apply patch" --> Core
+
+    %% Remediation Application
+    Core -- "Executes SQL patch with rollback" --> DB
+    Core -- "Writes outcome to Patch History" --> DB
+    Core -- "Publish REMEDIATION_COMPLETED" --> Valkey
+    Valkey -- "EventSource SSE Stream" --> Dashboard

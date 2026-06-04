@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taafi-config
+  namespace: taafi-system
+data:
+  TAAFI_LOG_DIR: "/app/logs"
+  CORE_ENGINE_URL: "http://core-engine-service:8000"
+  VALKEY_URL: "redis://valkey-service:6379"
+  ALLOWED_ORIGINS: "*"

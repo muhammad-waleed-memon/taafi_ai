@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neural-orchestrator-deploy
+  namespace: taafi-system
+  labels:
+    app: neural-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neural-orchestrator
+  template:
+    metadata:
+      labels:
+        app: neural-orchestrator
+    spec:
+      containers:
+        - name: neural-orchestrator
+          image: registry.cn-hangzhou.aliyuncs.com/taafi-autopilot/neural-orchestrator:latest
+          imagePullPolicy: Always
+          env:
+            - name: VALKEY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: taafi-config
+                  key: VALKEY_URL
+            - name: CORE_ENGINE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: taafi-config
+                  key: CORE_ENGINE_URL
+            - name: DASHSCOPE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: taafi-secret
+                  key: DASHSCOPE_API_KEY

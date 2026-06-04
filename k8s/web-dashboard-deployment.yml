@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-dashboard-deploy
+  namespace: taafi-system
+  labels:
+    app: web-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-dashboard
+  template:
+    metadata:
+      labels:
+        app: web-dashboard
+    spec:
+      containers:
+        - name: web-dashboard
+          image: registry.cn-hangzhou.aliyuncs.com/taafi-autopilot/web-dashboard:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80

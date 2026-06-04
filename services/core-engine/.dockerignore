@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.log
+logs/
+.venv/
+venv/
+Dockerfile
+docker-compose.yml
+kubernetes/
+k8s/
+tests/
+test_deadlock.py

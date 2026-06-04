@@ -85,6 +85,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     
     steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
     - name: Setup Alibaba Cloud CLI Credentials
       uses: aliyun/setup-cli-action@v1
       with:
@@ -99,13 +102,17 @@ jobs:
         mv kubeconfig ~/.kube/config
         chmod 600 ~/.kube/config
 
+    - name: Apply Kubernetes manifests
+      run: |
+        kubectl apply -f k8s/
+
     - name: Rolling Zero-Downtime Update to Kubernetes Pods
       run: |
-        kubectl set image deployment/core-engine-deploy core-engine=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/core-engine:${{ env.IMAGE_TAG }} --record
-        kubectl set image deployment/neural-orchestrator-deploy neural-orchestrator=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/neural-orchestrator:${{ env.IMAGE_TAG }} --record
-        kubectl set image deployment/web-dashboard-deploy web-dashboard=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/web-dashboard:${{ env.IMAGE_TAG }} --record
+        kubectl set image deployment/core-engine-deploy core-engine=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/core-engine:${{ env.IMAGE_TAG }} -n taafi-system
+        kubectl set image deployment/neural-orchestrator-deploy neural-orchestrator=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/neural-orchestrator:${{ env.IMAGE_TAG }} -n taafi-system
+        kubectl set image deployment/web-dashboard-deploy web-dashboard=${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/web-dashboard:${{ env.IMAGE_TAG }} -n taafi-system
         
         # Verify rollout status to guarantee zero degradation
-        kubectl rollout status deployment/core-engine-deploy --timeout=120s
-        kubectl rollout status deployment/neural-orchestrator-deploy --timeout=120s
-        kubectl rollout status deployment/web-dashboard-deploy --timeout=120s
+        kubectl rollout status deployment/core-engine-deploy -n taafi-system --timeout=120s
+        kubectl rollout status deployment/neural-orchestrator-deploy -n taafi-system --timeout=120s
+        kubectl rollout status deployment/web-dashboard-deploy -n taafi-system --timeout=120s

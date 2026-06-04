@@ -18,6 +18,8 @@ import ConsoleTerminal from './components/ConsoleTerminal';
 
 export default function App() {
   const [incidents, setIncidents] = useState([]);
+  const [approvals, setApprovals] = useState([]);
+  const [comments, setComments] = useState({});
   const [metrics, setMetrics] = useState({
     trapped: 0,
     unresolved: 0,
@@ -26,7 +28,7 @@ export default function App() {
 
   const fetchIncidents = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/incidents');
+      const res = await fetch('/api/incidents');
       if (res.ok) {
         const data = await res.json();
         setIncidents(data);
@@ -46,7 +48,6 @@ export default function App() {
           }
         });
 
-        // Dedup count for simulation logic
         setMetrics({ trapped, unresolved, resolved });
       }
     } catch (err) {
@@ -54,23 +55,82 @@ export default function App() {
     }
   };
 
+  const fetchApprovals = async () => {
+    try {
+      const res = await fetch('/api/approvals');
+      if (res.ok) {
+        const data = await res.json();
+        setApprovals(data);
+      }
+    } catch (err) {
+      console.error('Failed to pull approvals list:', err);
+    }
+  };
+
   useEffect(() => {
     fetchIncidents();
-    const interval = setInterval(fetchIncidents, 3000);
+    fetchApprovals();
+    const interval = setInterval(() => {
+      fetchIncidents();
+      fetchApprovals();
+    }, 3000);
     return () => clearInterval(interval);
   }, []);
 
   const triggerDeadlockSimulation = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/incidents/simulate', {
+      const res = await fetch('/api/incidents/simulate', {
         method: 'POST'
       });
       if (res.ok) {
         fetchIncidents();
+        fetchApprovals();
       }
     } catch (err) {
       console.error('Failed to trigger deadlock simulation:', err);
     }
+  };
+
+  const handleApprove = async (approvalId) => {
+    const comment = comments[approvalId] || '';
+    try {
+      const res = await fetch(`/api/approvals/${approvalId}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comment })
+      });
+      if (res.ok) {
+        fetchApprovals();
+        fetchIncidents();
+        // Clear comment
+        setComments(prev => ({ ...prev, [approvalId]: '' }));
+      }
+    } catch (err) {
+      console.error('Failed to approve patch:', err);
+    }
+  };
+
+  const handleReject = async (approvalId) => {
+    const comment = comments[approvalId] || '';
+    try {
+      const res = await fetch(`/api/approvals/${approvalId}/reject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comment })
+      });
+      if (res.ok) {
+        fetchApprovals();
+        fetchIncidents();
+        // Clear comment
+        setComments(prev => ({ ...prev, [approvalId]: '' }));
+      }
+    } catch (err) {
+      console.error('Failed to reject patch:', err);
+    }
+  };
+
+  const handleCommentChange = (approvalId, text) => {
+    setComments(prev => ({ ...prev, [approvalId]: text }));
   };
 
   return (
@@ -79,7 +139,7 @@ export default function App() {
       <header className="header">
         <div className="brand-section">
           <h1 className="brand-title">Taafi.ai</h1>
-          <span className="brand-badge">Autopilot SRE Agent v1.0</span>
+          <span className="brand-badge">Autopilot SRE Agent v2.0</span>
         </div>
         <button className="btn-simulate" onClick={triggerDeadlockSimulation}>
           ⚡ Trigger DB Deadlock Simulation
@@ -115,7 +175,7 @@ export default function App() {
         {/* Left Side - Trapped Lock Incidents */}
         <section className="panel">
           <div className="panel-header">
-            <h2 className="panel-title">🛡️ Trapped Database Lock Graphs</h2>
+            <h2 className="panel-title">🛡️ Trapped Deadlock Graphs</h2>
             <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Polling Live</span>
           </div>
           <div className="incidents-list">
@@ -156,10 +216,74 @@ export default function App() {
           </div>
         </section>
 
+        {/* Middle - Human-in-the-Loop Gate */}
+        <section className="panel">
+          <div className="panel-header">
+            <h2 className="panel-title">🎛️ Human-in-the-Loop Gate</h2>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Requires Action</span>
+          </div>
+          <div className="approvals-list">
+            {approvals.length === 0 ? (
+              <div style={{ color: 'var(--text-secondary)', textAlign: 'center', marginTop: '3rem' }}>
+                No high-risk operations queued. Auto-approved actions (CREATE INDEX) bypass this queue.
+              </div>
+            ) : (
+              approvals.map((appr, index) => {
+                const isPending = appr.status === 'PENDING';
+                return (
+                  <div key={index} className={`approval-card ${!isPending ? 'resolved' : 'pending'}`}>
+                    <div className="incident-card-header">
+                      <span className="incident-id">{appr.approval_id} ({appr.incident_id})</span>
+                      <span className={`status-badge ${appr.status.toLowerCase()}`}>
+                        {appr.status}
+                      </span>
+                    </div>
+
+                    <div className="query-label">Selected SRE Action Tool</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', marginBottom: '0.5rem', color: 'var(--amber)', fontWeight: '600' }}>
+                      {appr.tool} (Risk: {appr.risk_level})
+                    </div>
+
+                    <div className="query-label">Reasoning Diagnostic</div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-primary)', marginBottom: '0.75rem' }}>
+                      {appr.reasoning}
+                    </div>
+
+                    <div className="query-label">Proposed Patch SQL</div>
+                    <div className="query-dump" style={{ border: '1px solid rgba(242, 166, 5, 0.3)' }}>{appr.patch_sql}</div>
+
+                    {isPending ? (
+                      <div className="approval-actions">
+                        <input
+                          type="text"
+                          className="approval-comment-input"
+                          placeholder="Provide approval / rejection notes..."
+                          value={comments[appr.approval_id] || ''}
+                          onChange={(e) => handleCommentChange(appr.approval_id, e.target.value)}
+                        />
+                        <div className="approval-buttons">
+                          <button className="btn-approve" onClick={() => handleApprove(appr.approval_id)}>Approve Patch</button>
+                          <button className="btn-reject" onClick={() => handleReject(appr.approval_id)}>Reject</button>
+                        </div>
+                      </div>
+                    ) : (
+                      appr.comment && (
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          <strong>Notes:</strong> {appr.comment}
+                        </div>
+                      )
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </section>
+
         {/* Right Side - Autopilot Console Terminal */}
         <section className="panel">
           <div className="panel-header">
-            <h2 className="panel-title">🤖 Autopilot SRE Agent Telemetry</h2>
+            <h2 className="panel-title">🤖 Autopilot Telemetry</h2>
           </div>
           <ConsoleTerminal />
         </section>

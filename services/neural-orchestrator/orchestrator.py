@@ -1,11 +1,11 @@
 # Copyright 2026 Muhammad Waleed & Areeba
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,97 +14,262 @@
 
 import os
 import json
+import uuid
 import asyncio
 import logging
-import httpx
+
+import valkey.asyncio as aioredis
+
 from compressor import ContextCompressor
 from analyzer_agent import DeadlockAnalyzerAgent
 from fixer_agent import DeadlockFixerAgent
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger("neural-orchestrator.main")
 
-INCIDENT_LOG_PATH = "c:/Users/S.A COMPUTER/Desktop/taafi_ai/services/core-engine/logs/active_incidents.log"
-CORE_ENGINE_URL = os.getenv("CORE_ENGINE_URL", "http://localhost:8000")
+# ─── Environment Configuration ────────────────────────────────────────────────
+VALKEY_URL = os.getenv("VALKEY_URL", "redis://valkey:6379")
+CORE_ENGINE_URL = os.getenv("CORE_ENGINE_URL", "http://core-engine:8000")
+
+INCIDENT_CHANNEL = "taafi:incidents"
+REMEDIATION_CHANNEL = "taafi:remediation"
+
+# Risk classification keywords
+AUTO_APPROVE_TOOLS = {"create_index"}                          # always safe
+ESCALATE_TOOLS = {"kill_query", "drop_table", "reorder_transaction"}  # human approval required
+
 
 class AutopilotOrchestrator:
     def __init__(self):
         self.analyzer = DeadlockAnalyzerAgent()
         self.fixer = DeadlockFixerAgent()
-        self.processed_incidents = set()
+        # Track incident IDs we have already dispatched to avoid double-processing
+        self.processed_incidents: set = set()
+        # Map approval_id → remediation context, awaiting human decision
+        self.pending_approvals: dict = {}
+        self.valkey: aioredis.Valkey = None
 
-    async def poll_active_incidents(self):
-        """Polls the active incidents file for new deadlocks requiring self-healing remediation."""
-        logger.info("Autopilot Orchestrator started. Watching active_incidents.log...")
-        
-        while True:
+    # ─── Startup ──────────────────────────────────────────────────────────
+    async def connect(self):
+        self.valkey = aioredis.Valkey.from_url(VALKEY_URL, decode_responses=True)
+        await self.valkey.ping()
+        logger.info("Neural Orchestrator connected to Valkey at %s", VALKEY_URL)
+
+    # ─── Main Loop ────────────────────────────────────────────────────────
+    async def run(self):
+        """Subscribe to Valkey channels and dispatch handlers for each message."""
+        await self.connect()
+        pubsub = self.valkey.pubsub()
+        await pubsub.subscribe(INCIDENT_CHANNEL)
+        logger.info("Subscribed to Valkey channel: %s", INCIDENT_CHANNEL)
+
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+
             try:
-                if os.path.exists(INCIDENT_LOG_PATH):
-                    with open(INCIDENT_LOG_PATH, "r") as f:
-                        lines = f.readlines()
-                    
-                    for line in lines:
-                        if not line.strip():
-                            continue
-                        
-                        incident_data = json.loads(line)
-                        details = incident_data.get("details", {})
-                        incident_id = details.get("incident_id")
-                        category = incident_data.get("category")
-                        
-                        # Process only unresolved deadlock incidents we haven't handled yet
-                        if category == "DEADLOCK_TRAPPED" and incident_id not in self.processed_incidents:
-                            self.processed_incidents.add(incident_id)
-                            asyncio.create_task(self.remediate_flow(incident_data))
-                            
-            except Exception as e:
-                logger.error(f"Error during incident log polling: {e}")
-                
-            await asyncio.sleep(2.0)
+                event = json.loads(message["data"])
+            except json.JSONDecodeError:
+                logger.warning("Received non-JSON message on channel – skipping.")
+                continue
 
+            category = event.get("category")
+
+            if category == "DEADLOCK_TRAPPED":
+                details = event.get("details", {})
+                incident_id = details.get("incident_id")
+                if incident_id and incident_id not in self.processed_incidents:
+                    self.processed_incidents.add(incident_id)
+                    asyncio.create_task(self.remediate_flow(event))
+
+            elif category == "APPROVAL_GRANTED":
+                details = event.get("details", {})
+                approval_id = details.get("approval_id")
+                asyncio.create_task(self.execute_approved_patch(event))
+
+            elif category == "APPROVAL_REJECTED":
+                details = event.get("details", {})
+                approval_id = details.get("approval_id")
+                incident_id = details.get("incident_id")
+                logger.warning(
+                    "Approval %s REJECTED by human operator – incident %s stays unresolved.",
+                    approval_id, incident_id,
+                )
+
+
+    # ─── Remediation Flow ─────────────────────────────────────────────────
     async def remediate_flow(self, incident: dict):
-        """Orchestrates the end-to-end trapping, analysis, Qwen patching, sandboxing, and execution."""
+        """
+        Full autopilot pipeline:
+        1. Compress context
+        2. Retrieve few-shot similar incidents from Core Engine
+        3. Analyze deadlock
+        4. Ask Qwen for structured tool call
+        5. Risk-classify: auto-approve safe tools, escalate destructive ones
+        6. Apply or queue for human approval
+        """
+        import httpx
         details = incident.get("details", {})
         incident_id = details.get("incident_id")
-        
-        logger.info(f"🔄 Starting autopilot remediation flow for incident: {incident_id}")
-        
-        # 1. Compress Transaction Context
-        compressed = ContextCompressor.compress_incident(incident)
-        logger.info(f"Compressed transaction logs context. Reduced DDL schemas token volume.")
-        
-        # 2. Analyze Lock Conflicts
-        analysis = await self.analyzer.analyze_incident(compressed)
-        logger.info(f"Deadlock collision analysis narrative built: {analysis['analysis_narrative']}")
-        
-        # 3. Request Healing Patch from Qwen
-        patch_sql, reasoning = await self.fixer.generate_patch_via_qwen(compressed, analysis)
-        logger.info(f"Healing SQL patch generated: {patch_sql}")
-        
-        # 4. Dry-run Sandbox Validation
-        sandbox_ok = await self.fixer.execute_in_sandbox(compressed.get("schema", ""), patch_sql)
-        
-        if sandbox_ok:
-            logger.info("Sandbox dry-run successful. Applying hot-patch to production RDS pool...")
-            
-            # 5. Apply SQL Remediation Patch
-            async with httpx.AsyncClient() as client:
-                try:
-                    payload = {
-                        "incident_id": incident_id,
-                        "suggested_patch": patch_sql,
-                        "reasoning": reasoning
-                    }
-                    response = await client.post(f"{CORE_ENGINE_URL}/api/incidents/remediate", json=payload)
-                    if response.status_code == 200:
-                        logger.info(f"Successfully remediated incident: {incident_id}")
-                    else:
-                        logger.error(f"Failed to post remediation: {response.text}")
-                except Exception as e:
-                    logger.error(f"Error calling remediation API: {e}")
-        else:
-            logger.error(f"Sandbox check failed. Autopilot aborted remediation to prevent zero-downtime degradation.")
+        logger.info("🔄 Starting autopilot remediation for incident: %s", incident_id)
 
+        # 1. Compress context
+        compressed = ContextCompressor.compress_incident(incident)
+
+        # 2. Retrieve similar past incidents (persistent memory)
+        few_shot_examples = []
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{CORE_ENGINE_URL}/api/incidents/similar", params={
+                    "table_names": ",".join(
+                        t for t in [compressed.get("db", "")] if t
+                    ),
+                    "lock_types": ",".join(compressed.get("locks", [])),
+                    "limit": 3,
+                })
+                if resp.status_code == 200:
+                    few_shot_examples = resp.json()
+        except Exception as exc:
+            logger.warning("Could not fetch few-shot examples: %s", exc)
+
+        # 3. Analyze
+        analysis = await self.analyzer.analyze_incident(compressed)
+        logger.info("Analysis: %s", analysis.get("analysis_narrative", ""))
+
+        # 4. Generate structured Qwen patch
+        fixer_result = await self.fixer.generate_patch_via_qwen(
+            compressed, analysis, few_shot_examples
+        )
+        tool_name = fixer_result.get("tool", "create_index")
+        parameters = fixer_result.get("parameters", {})
+        reasoning = fixer_result.get("reasoning", "")
+        patch_sql = parameters.get("sql", "")
+
+        logger.info("Qwen selected tool '%s': %s", tool_name, patch_sql)
+
+        # Publish REMEDIATION_TRIGGERED so the web dashboard console displays it in real time
+        from datetime import datetime
+        if self.valkey:
+            await self.valkey.publish(
+                REMEDIATION_CHANNEL,
+                json.dumps({
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "level": "INFO",
+                    "category": "REMEDIATION_TRIGGERED",
+                    "details": {
+                        "incident_id": incident_id,
+                        "patch": patch_sql,
+                        "reasoning": reasoning,
+                        "tool": tool_name
+                    }
+                })
+            )
+
+        # 5. Sandbox validation
+        sandbox_ok = await self.fixer.execute_in_sandbox(
+            compressed.get("schema", ""), patch_sql
+        )
+        if not sandbox_ok:
+            logger.error("Sandbox validation FAILED – aborting remediation for %s", incident_id)
+            return
+
+        # 6. Risk classification
+        if tool_name in AUTO_APPROVE_TOOLS:
+            logger.info("Tool '%s' auto-approved – applying immediately.", tool_name)
+            await self._apply_patch(incident_id, patch_sql, reasoning, tool_name)
+        else:
+            logger.warning(
+                "Tool '%s' is HIGH-RISK – escalating to human approval queue.", tool_name
+            )
+            await self._create_approval_request(
+                incident_id, patch_sql, tool_name, parameters, reasoning
+            )
+
+    # ─── Execute Approved Patch ───────────────────────────────────────────
+    async def execute_approved_patch(self, event: dict):
+        """Called when a human approves a previously queued patch."""
+        import httpx
+        details = event.get("details", event)
+        incident_id = details.get("incident_id")
+        patch = details.get("patch", "")
+        reasoning = details.get("reasoning", "")
+        tool = details.get("tool", "")
+        approval_id = details.get("approval_id")
+
+        logger.info("✅ Human approved patch for incident %s (approval %s)", incident_id, approval_id)
+        await self._apply_patch(incident_id, patch, reasoning, tool)
+
+    # ─── Internal Helpers ─────────────────────────────────────────────────
+    async def _apply_patch(self, incident_id: str, patch_sql: str, reasoning: str, tool: str):
+        """POST the verified patch to the Core Engine for DB execution."""
+        import httpx
+        payload = {
+            "incident_id": incident_id,
+            "suggested_patch": patch_sql,
+            "reasoning": reasoning,
+            "tool": tool,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{CORE_ENGINE_URL}/api/incidents/remediate", json=payload
+                )
+                if resp.status_code == 200:
+                    logger.info("✅ Incident %s resolved successfully.", incident_id)
+                else:
+                    logger.error("Remediation API error %d: %s", resp.status_code, resp.text)
+        except Exception as exc:
+            logger.error("Error calling Core Engine remediation API: %s", exc)
+
+    async def _create_approval_request(
+        self,
+        incident_id: str,
+        patch_sql: str,
+        tool: str,
+        parameters: dict,
+        reasoning: str,
+    ):
+        """Persist an approval request in the Core Engine and publish to Valkey for the dashboard."""
+        import httpx
+        approval_id = f"APR-{uuid.uuid4().hex[:8].upper()}"
+        payload = {
+            "approval_id": approval_id,
+            "incident_id": incident_id,
+            "patch_sql": patch_sql,
+            "tool": tool,
+            "parameters": parameters,
+            "reasoning": reasoning,
+            "risk_level": "HIGH",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{CORE_ENGINE_URL}/api/approvals", json=payload
+                )
+                if resp.status_code in (200, 201):
+                    logger.info("Approval request %s created for incident %s", approval_id, incident_id)
+                else:
+                    logger.error(
+                        "Could not create approval record: %d %s", resp.status_code, resp.text
+                    )
+        except Exception as exc:
+            logger.error("Error posting approval request: %s", exc)
+
+        # Also publish to Valkey so dashboard shows the pending approval immediately
+        if self.valkey:
+            await self.valkey.publish(
+                INCIDENT_CHANNEL,
+                json.dumps({
+                    "category": "APPROVAL_REQUESTED",
+                    **payload,
+                }),
+            )
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     orchestrator = AutopilotOrchestrator()
-    asyncio.run(orchestrator.poll_active_incidents())
+    asyncio.run(orchestrator.run())
